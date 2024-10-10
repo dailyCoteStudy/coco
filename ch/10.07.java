@@ -17,18 +17,27 @@ public class Solve {
         Scanner scanner = new Scanner(System.in);
 
         String value = scanner.next();
+//        value = "55-50+40-30+90"
+//        value = "55+11+44+19" //[55,11,44,19]
 
 
         if (value.contains("-")) {
-            String[] minusBox = value.split("-");
+//            55+90-50+40-30+90
+            String[] minusBox = value.split("-"); // [55+90, 50+40, 30+90]
             int result = 0;
 
-            String[] first = minusBox[0].split("\\+");
+            String[] first = minusBox[0].split("\\+"); //[55, 90]
             for (String s : first) {
                 result += Integer.parseInt(s);
             }
+            result = 145
 
             for (int i = 1; i < minusBox.length; i++) {
+                /**
+                 * i = 1;  split = [50, 40]
+                 * i = 2;  split = [30, 90]
+                 *
+                 */
                 String[] split = minusBox[i].split("\\+");
                 int minusValue = 0;
                 for (String s : split) {
@@ -41,7 +50,7 @@ public class Solve {
 
 
         } else {
-            String[] split = value.split("\\+");
+            String[] split = value.split("\\+"); //[55,11,44,19]
             System.out.println(Arrays.stream(split).mapToInt(Integer::parseInt).sum());
         }
 
