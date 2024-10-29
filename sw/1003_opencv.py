@@ -84,24 +84,24 @@
 # 4) 'cv.arrowedLine'를 이용하여 'laugh'글자가 직사각형을 가리키도록 프로그램을 작성(수정)하시오.
 # 유인물 프로그램 2-6 참고
 
-# import cv2 as cv
-# import sys
+import cv2 as cv
+import sys
 
-# img = cv.imread('./img/girl_laughing.jpg')
+img = cv.imread('./img/girl_laughing.jpg')
 
-# if img is None:
-#     sys.exit('파일을 찾을 수 없습니다.')
+if img is None:
+    sys.exit('파일을 찾을 수 없습니다.')
 
-# cv.rectangle(img,(830,30),(1000,200),(0,0,255),2)
-# cv.putText(img,'laugh',(700,24),cv.FONT_HERSHEY_SIMPLEX,1,(255,0,0),2)
-# cv.arrowedLine(img, (780,30), (820,50),(0,0,255), 3)
+cv.rectangle(img,(830,30),(1000,200),(0,0,255),2)
+cv.putText(img,'laugh',(700,24),cv.FONT_HERSHEY_SIMPLEX,1,(255,0,0),2)
+cv.arrowedLine(img, (780,30), (820,50),(0,0,255), 3)
 
-# cv.imshow('Draw', img)
+cv.imshow('Draw', img)
 
-# while(True):
-#     if cv.waitKey() == ord('q'):
-#         cv.destroyAllWindows()
-#         break
+while(True):
+    if cv.waitKey() == ord('q'):
+        cv.destroyAllWindows()
+        break
 
 
 # 5) 왼쪽 버튼을 클릭하면 직사각형, 오른쪽 버튼을 클릭하면 원이 그려지도록 프로그램을 작성하시오.
