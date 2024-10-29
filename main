@@ -1,0 +1,1245 @@
+import json
+import os
+import shutil
+from distutils.util import strtobool
+from pathlib import Path
+
+import time
+
+import numpy as np
+import torch
+from colorama import Fore, Style
+from torch.utils.tensorboard import SummaryWriter
+from torchvision import transforms
+
+from torch.utils.data import DataLoader
+
+import torch.nn as nn
+
+
+import torch.utils.model_zoo as model_zoo
+import torchvision.models as models
+from torch.hub import load_state_dict_from_url
+
+from torch import nn
+
+
+class CrossEntropyLoss2d(nn.Module):
+    """This criterion combines nn.LogSoftmax() and nn.NLLLoss() in one single class."""
+
+    def __init__(self, weight=None, ignore_index=-100):
+        super().__init__()
+        self.CE = nn.CrossEntropyLoss(weight=weight, ignore_index=ignore_index)
+
+    def forward(self, output, target):
+        loss = self.CE(output, target)
+        return loss
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, weight=None, ignore_index=-100, gamma=2, size_average=True):
+        super().__init__()
+        self.gamma = gamma
+        self.size_average = size_average
+        self.loss = nn.CrossEntropyLoss(weight=weight, ignore_index=ignore_index)
+
+    def forward(self, output, target):
+        logpt = self.loss(output, target)
+        pt = torch.exp(-logpt)
+        loss = ((1 - pt) ** self.gamma) * logpt
+        if self.size_average:
+            return loss.mean()
+        return loss.sum()
+
+
+
+
+
+def convblock(in_planes, out_planes):
+    """Layer to perform a convolution followed by ELU"""
+    return nn.Sequential(conv3x3(in_planes, out_planes), nn.ELU(inplace=True))
+
+
+def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
+    """3x3 convolution with padding"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=dilation,
+                     groups=groups, bias=False, dilation=dilation)
+
+
+def conv1x1(in_planes, out_planes, stride=1):
+    """1x1 convolution"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
+
+
+class PixelShuffleICNR(nn.Module):
+    def __init__(self, in_planes, out_planes, scale=2):
+        super().__init__()
+        self.conv = conv1x1(in_planes, out_planes)
+        self.shuffle = nn.PixelShuffle(scale)
+        kernel = self.ICNR(self.conv.weight, upscale_factor=scale)
+        self.conv.weight.data.copy_(kernel)
+
+    @staticmethod
+    def ICNR(tensor, upscale_factor=2, inizializer=nn.init.kaiming_normal_):
+        """Fills the input Tensor or Variable with values according to the method
+        described in "Checkerboard artifact free sub-pixel convolution" https://arxiv.org/abs/1707.02937
+        Andrew Aitken et al. (2017), this inizialization should be used in the
+        last convolutional layer before a PixelShuffle operation
+        :param tensor: an n-dimensional torch.Tensor or autograd.Variable
+        :param upscale_factor: factor to increase spatial resolution by
+        :param inizializer: inizializer to be used for sub_kernel inizialization
+        """
+        new_shape = [int(tensor.shape[0] / (upscale_factor ** 2))] + list(tensor.shape[1:])
+        sub_kernel = torch.zeros(new_shape)
+        sub_kernel = inizializer(sub_kernel)
+        sub_kernel = sub_kernel.transpose(0, 1)
+        sub_kernel = sub_kernel.contiguous().view(sub_kernel.shape[0], sub_kernel.shape[1], -1)
+        kernel = sub_kernel.repeat(1, 1, upscale_factor ** 2)
+        transposed_shape = [tensor.shape[1]] + [tensor.shape[0]] + list(tensor.shape[2:])
+        kernel = kernel.contiguous().view(transposed_shape)
+        kernel = kernel.transpose(0, 1)
+        return kernel
+
+    def forward(self, x):
+        return self.shuffle(self.conv(x))
+
+
+class NormDecoder(nn.Module):
+    def __init__(self, num_ch_enc, num_output_channels=1):
+        super().__init__()
+        self.num_output_channels = num_output_channels
+        self.sigmoid = nn.Sigmoid()
+
+        self.num_ch_enc = num_ch_enc
+        self.num_ch_dec = np.array([16, 32, 64, 128, 256])
+
+        # decoder
+        self.upconv_4_0 = convblock(self.num_ch_enc[-1], self.num_ch_dec[4])
+        self.upconv_4_1 = convblock(self.num_ch_dec[4] + self.num_ch_enc[3], self.num_ch_dec[4])
+
+        self.upconv_3_0 = convblock(self.num_ch_dec[4], self.num_ch_dec[3])
+        self.upconv_3_1 = convblock(self.num_ch_dec[3] + self.num_ch_enc[2], self.num_ch_dec[3])
+
+        self.upconv_2_0 = convblock(self.num_ch_dec[3], self.num_ch_dec[2])
+        self.upconv_2_1 = convblock(self.num_ch_dec[2] + self.num_ch_enc[1], self.num_ch_dec[2])
+
+        self.upconv_1_0 = convblock(self.num_ch_dec[2], self.num_ch_dec[1])
+        self.upconv_1_1 = convblock(self.num_ch_dec[1] + self.num_ch_enc[0], self.num_ch_dec[1])
+
+        self.upconv_0_0 = convblock(self.num_ch_dec[1], self.num_ch_dec[0])
+        self.upconv_0_1 = convblock(self.num_ch_dec[0], self.num_ch_dec[0])
+
+        self.normconv_0 = conv3x3(self.num_ch_dec[0], self.num_output_channels)
+
+        self.shuffle_conv_4_0 = PixelShuffleICNR(self.num_ch_dec[4], self.num_ch_dec[4] * 4)
+        self.shuffle_conv_3_0 = PixelShuffleICNR(self.num_ch_dec[3], self.num_ch_dec[3] * 4)
+        self.shuffle_conv_2_0 = PixelShuffleICNR(self.num_ch_dec[2], self.num_ch_dec[2] * 4)
+        self.shuffle_conv_1_0 = PixelShuffleICNR(self.num_ch_dec[1], self.num_ch_dec[1] * 4)
+        self.shuffle_conv_0_0 = PixelShuffleICNR(self.num_ch_dec[0], self.num_ch_dec[0] * 4)
+
+        self.shuffle_conv_3 = PixelShuffleICNR(self.num_ch_dec[3], 64, scale=8)
+        self.shuffle_conv_2 = PixelShuffleICNR(self.num_ch_dec[2], 16, scale=4)
+        self.shuffle_conv_1 = PixelShuffleICNR(self.num_ch_dec[1], 4, scale=2)
+
+    def forward(self, input_features):
+        outputs = dict()
+        x = input_features[-1]
+
+        x = self.upconv_4_0(x)
+        x = self.shuffle_conv_4_0(x)
+        x = torch.cat((x, input_features[3]), dim=1)
+        x = self.upconv_4_1(x)
+
+        x = self.upconv_3_0(x)
+        x = self.shuffle_conv_3_0(x)
+        x = torch.cat((x, input_features[2]), dim=1)
+        x_3 = self.upconv_3_1(x)
+
+        x = self.upconv_2_0(x_3)
+        x = self.shuffle_conv_2_0(x)
+        x = torch.cat((x, input_features[1]), dim=1)
+        x_2 = self.upconv_2_1(x)
+
+        x = self.upconv_1_0(x_2)
+        x = self.shuffle_conv_1_0(x)
+        x = torch.cat((x, input_features[0]), dim=1)
+        x_1 = self.upconv_1_1(x)
+
+        x = self.upconv_0_0(x_1)
+        x = self.shuffle_conv_0_0(x)
+
+        if torch.onnx.is_in_onnx_export():
+            return self.sigmoid(self.normconv_0(x))
+        else:
+            outputs[("norm", 3)] = self.sigmoid(self.shuffle_conv_3(x_3))
+            outputs[("norm", 2)] = self.sigmoid(self.shuffle_conv_2(x_2))
+            outputs[("norm", 1)] = self.sigmoid(self.shuffle_conv_1(x_1))
+            outputs[("norm", 0)] = self.sigmoid(self.normconv_0(x))
+            return outputs
+
+
+
+
+
+
+model_urls = dict(resnet18='https://download.pytorch.org/models/resnet18-5c106cde.pth',
+                  resnet50='https://download.pytorch.org/models/resnet50-19c8e357.pth')
+
+
+def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
+    """3x3 convolution with padding"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=dilation,
+                     groups=groups, bias=False, dilation=dilation)
+
+
+def conv1x1(in_planes, out_planes, stride=1):
+    """1x1 convolution"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
+
+
+class BasicBlock(nn.Module):
+    expansion = 1
+    def __init__(self, inplanes, planes, stride=1, downsample=None, groups=1,
+                 base_width=64, dilation=1, norm_layer=None):
+        super().__init__()
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d
+        if groups != 1 or base_width != 64:
+            raise ValueError('BasicBlock only supports groups=1 and base_width=64')
+        if dilation > 1:
+            raise NotImplementedError("Dilation > 1 not supported in BasicBlock")
+        # Both self.conv1 and self.downsample layers downsample the input when stride != 1
+        self.conv1 = conv3x3(inplanes, planes, stride)
+        self.bn1 = norm_layer(planes)
+        self.relu = nn.ReLU(inplace=False)
+        self.conv2 = conv3x3(planes, planes)
+        self.bn2 = norm_layer(planes)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x):
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu(out)
+        return out
+
+
+class Bottleneck(nn.Module):
+    expansion = 4
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None, groups=1,
+                 base_width=64, dilation=1, norm_layer=None):
+        super().__init__()
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d
+        width = int(planes * (base_width / 64.)) * groups
+        # Both self.conv2 and self.downsample layers downsample the input when stride != 1
+        self.conv1 = conv1x1(inplanes, width)
+        self.bn1 = norm_layer(width)
+        self.conv2 = conv3x3(width, width, stride, groups, dilation)
+        self.bn2 = norm_layer(width)
+        self.conv3 = conv1x1(width, planes * self.expansion)
+        self.bn3 = norm_layer(planes * self.expansion)
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x):
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu(out)
+        return out
+
+
+class ResNetMultiImageInput(nn.Module):
+    """Constructs a resnet model with varying number of input images."""
+
+    def __init__(self, block, layers, num_input_images=1, groups=1, width_per_group=64,
+                 replace_stride_with_dilation=None, norm_layer=None, multi_image=False, num_classes=1000):
+        super().__init__()
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d
+
+        self._norm_layer = norm_layer
+        self.inplanes = 64
+        self.dilation = 1
+        if replace_stride_with_dilation is None:
+            # each element in the tuple indicates if we should replace
+            # the 2x2 stride with a dilated convolution instead
+            replace_stride_with_dilation = [False, False, False]
+        if len(replace_stride_with_dilation) != 3:
+            raise ValueError(f"replace_stride_with_dilation should be None "
+                             f"or a 3-element tuple, got {replace_stride_with_dilation}")
+        self.groups = groups
+        self.base_width = width_per_group
+
+        if multi_image:
+            self.conv1 = nn.Conv2d(num_input_images * 3, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        else:
+            self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False)
+
+        self.bn1 = norm_layer(self.inplanes)
+        self.relu = nn.ReLU(inplace=False)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.layer1 = self._make_layer(block, 64, layers[0])
+        self.layer2 = self._make_layer(block, 128, layers[1], stride=2, dilate=replace_stride_with_dilation[0])
+        self.layer3 = self._make_layer(block, 256, layers[2], stride=2, dilate=replace_stride_with_dilation[1])
+        self.layer4 = self._make_layer(block, 512, layers[3], stride=2, dilate=replace_stride_with_dilation[2])
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(512 * block.expansion, num_classes)
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def _make_layer(self, block, planes, blocks, stride=1, dilate=False):
+        norm_layer = self._norm_layer
+        downsample = None
+        previous_dilation = self.dilation
+        if dilate:
+            self.dilation *= stride
+            stride = 1
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(conv1x1(self.inplanes, planes * block.expansion, stride),
+                                       norm_layer(planes * block.expansion))
+
+        layers = []
+        layers.append(block(self.inplanes, planes, stride, downsample, self.groups,
+                            self.base_width, previous_dilation, norm_layer))
+        self.inplanes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.inplanes, planes, groups=self.groups,
+                                base_width=self.base_width, dilation=self.dilation,
+                                norm_layer=norm_layer))
+
+        return nn.Sequential(*layers)
+
+
+def resnet_multiimage_input(num_layers, pretrained=False, num_input_images=1):
+    """Constructs a ResNet model
+    :param num_layers: (int): Number of resnet layers. Must be 18 or 50
+    :param pretrained: (bool): If True, returns a model pre-trained on ImageNet
+    :param num_input_images: (int): Number of frames stacked as input
+    :param zero_init_residual: Zero-initialize the last BN in each residual branch
+    """
+    assert num_layers in [18, 50], "Can only run with 18 or 50 layer resnet"
+    blocks = {18: [2, 2, 2, 2],
+              50: [3, 4, 6, 3]}[num_layers]
+    block_type = {18: BasicBlock,
+                  50: Bottleneck}[num_layers]
+
+    multi_image = True if num_input_images > 1 else False
+    model = ResNetMultiImageInput(block_type, blocks, num_input_images=num_input_images, multi_image=multi_image)
+
+    if pretrained:
+        loaded = model_zoo.load_url(models.resnet.model_urls[f'resnet{num_layers}'])
+        loaded['conv1.weight'] = torch.cat([loaded['conv1.weight']] * num_input_images, 1) / num_input_images
+        model.load_state_dict(loaded)
+    return model
+
+
+def _resnet(arch, block, layers, pretrained, progress, **kwargs):
+    model = ResNetMultiImageInput(block, layers, **kwargs)
+    if pretrained:
+        state_dict = load_state_dict_from_url(model_urls[arch], progress=progress)
+        model.load_state_dict(state_dict)
+    return model
+
+
+def resnet18(pretrained=False, progress=True, **kwargs):
+    """ResNet-18 model from `"Deep Residual Learning for Image Recognition" <https://arxiv.org/pdf/1512.03385.pdf>"""
+    return _resnet('resnet18', BasicBlock, [2, 2, 2, 2], pretrained, progress, **kwargs)
+
+
+def resnet50(pretrained=False, progress=True, **kwargs):
+    """ResNet-50 model from `"Deep Residual Learning for Image Recognition" <https://arxiv.org/pdf/1512.03385.pdf>"""
+    return _resnet('resnet50', Bottleneck, [3, 4, 6, 3], pretrained, progress, **kwargs)
+
+
+class ResnetEncoder(nn.Module):
+    """Pytorch module for a resnet encoder"""
+
+    def __init__(self, num_layers, pretrained, num_input_images=1):
+        super().__init__()
+        self.num_ch_enc = np.array([64, 64, 128, 256, 512])
+        # resnet taken from torchvision models
+        resnets = {18: resnet18(pretrained=pretrained),
+                   50: resnet50(pretrained=pretrained)}
+        if num_layers not in resnets:
+            raise ValueError(f"{num_layers} is not a valid number of resnet layers")
+
+        if num_input_images > 1:
+            self.encoder = resnet_multiimage_input(num_layers, pretrained, num_input_images)
+        else:
+            self.encoder = resnets[num_layers]
+
+        if num_layers > 34:
+            self.num_ch_enc[1:] *= 4
+
+    def forward(self, input_image):
+        features = list()
+        x = self.encoder.conv1(input_image)
+        x = self.encoder.bn1(x)
+        features.append(self.encoder.relu(x))
+        features.append(self.encoder.layer1(self.encoder.maxpool(features[-1])))
+        features.append(self.encoder.layer2(features[-1]))
+        features.append(self.encoder.layer3(features[-1]))
+        features.append(self.encoder.layer4(features[-1]))
+        return features
+
+
+
+
+
+def convblock(in_planes, out_planes):
+    """Layer to perform a convolution, BatchNorm followed by ReLU"""
+    return nn.Sequential(conv3x3(in_planes, out_planes),
+                         nn.BatchNorm2d(out_planes),
+                         nn.ReLU(inplace=True))
+
+
+class SemanticDecoder(nn.Module):
+    def __init__(self, num_ch_enc, n_classes=20):
+        super().__init__()
+        self.n_classes = n_classes
+
+        self.num_ch_enc = num_ch_enc  # [64, 64, 128, 256, 512]
+        self.num_ch_dec = np.array([16, 32, 64, 128, 256])
+
+        # decoder
+        self.upconv_4_0 = convblock(self.num_ch_enc[-1], self.num_ch_dec[4])
+        self.upconv_4_1 = convblock(self.num_ch_dec[4] + self.num_ch_enc[3], self.num_ch_dec[4])
+
+        self.upconv_3_0 = convblock(self.num_ch_dec[4], self.num_ch_dec[3])
+        self.upconv_3_1 = convblock(self.num_ch_dec[3] + self.num_ch_enc[2], self.num_ch_dec[3])
+
+        self.upconv_2_0 = convblock(self.num_ch_dec[3], self.num_ch_dec[2])
+        self.upconv_2_1 = convblock(self.num_ch_dec[2] + self.num_ch_enc[1], self.num_ch_dec[2])
+
+        self.upconv_1_0 = convblock(self.num_ch_dec[2], self.num_ch_dec[1])
+        self.upconv_1_1 = convblock(self.num_ch_dec[1] + self.num_ch_enc[0], self.num_ch_dec[1])
+
+        self.upconv_0_0 = convblock(self.num_ch_dec[1], self.num_ch_dec[0])
+        self.upconv_0_1 = convblock(self.num_ch_dec[0], self.num_ch_dec[0])
+
+        self.semantic_conv_0 = conv3x3(self.num_ch_dec[0], self.n_classes)
+
+        self.shuffle_conv_4_0 = PixelShuffleICNR(self.num_ch_dec[4], self.num_ch_dec[4] * 4)
+        self.shuffle_conv_3_0 = PixelShuffleICNR(self.num_ch_dec[3], self.num_ch_dec[3] * 4)
+        self.shuffle_conv_2_0 = PixelShuffleICNR(self.num_ch_dec[2], self.num_ch_dec[2] * 4)
+        self.shuffle_conv_1_0 = PixelShuffleICNR(self.num_ch_dec[1], self.num_ch_dec[1] * 4)
+        self.shuffle_conv_0_0 = PixelShuffleICNR(self.num_ch_dec[0], self.num_ch_dec[0] * 4)
+
+        self.shuffle_conv_3 = PixelShuffleICNR(self.num_ch_dec[3], 64 * self.n_classes, scale=8)
+        self.shuffle_conv_2 = PixelShuffleICNR(self.num_ch_dec[2], 16 * self.n_classes, scale=4)
+        self.shuffle_conv_1 = PixelShuffleICNR(self.num_ch_dec[1], 4 * self.n_classes, scale=2)
+
+    def forward(self, input_features):
+        outputs = dict()
+        x = input_features[-1]
+
+        x = self.upconv_4_0(x)
+        x = self.shuffle_conv_4_0(x)
+        x_g3 = torch.cat((x, input_features[3]), dim=1)
+        x = self.upconv_4_1(x_g3)
+
+        x = self.upconv_3_0(x)
+        x = self.shuffle_conv_3_0(x)
+        x_g2 = torch.cat((x, input_features[2]), dim=1)
+        x_3 = self.upconv_3_1(x_g2)
+
+        x = self.upconv_2_0(x_3)
+        x = self.shuffle_conv_2_0(x)
+        x_g1 = torch.cat((x, input_features[1]), dim=1)
+        x_2 = self.upconv_2_1(x_g1)
+
+        x = self.upconv_1_0(x_2)
+        x = self.shuffle_conv_1_0(x)
+        x_g0 = torch.cat((x, input_features[0]), dim=1)
+        x_1 = self.upconv_1_1(x_g0)
+
+        x = self.upconv_0_0(x_1)
+        x = self.shuffle_conv_0_0(x)
+
+        if torch.onnx.is_in_onnx_export():
+            return self.semantic_conv_0(x)
+        else:
+            outputs[("semantic", 0)] = self.semantic_conv_0(x)
+            return outputs
+
+
+
+
+
+"""
+WoodScape Raw dataset loader class for OmniDet.
+
+# author: Varun Ravi Kumar <rvarun7777@gmail.com>
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; Authors provide no warranty with the software
+and are not liable for anything.
+"""
+
+import pickle
+import random
+
+import torch.utils.data as data
+from PIL import Image  # using pillow-simd for increased speed
+from torchvision import transforms
+
+
+class WoodScapeRawDataset(data.Dataset):
+    """Fisheye Woodscape Raw dataloader"""
+
+    def __init__(self, data_path=None, path_file=None, is_train=False, config=None):
+        super().__init__()
+
+        self.data_path = data_path
+        self.image_paths = [line.rstrip('\n') for line in open(path_file)]
+        self.is_train = is_train
+        self.args = config
+        self.task = config['train']
+        self.batch_size = config['batch_size']
+        self.crop = config['crop']
+        self.semantic_classes = config['semantic_num_classes']
+        self.num_scales = config['num_scales']
+        self.frame_idxs = config['frame_idxs']
+        self.original_res_w = 1280
+        self.original_res_h = 960 #966 #966:woodscape
+        self.network_input_width = config['input_width']
+        self.network_input_height = config['input_height']
+        self.total_car1_images = 6054
+        self.color_aug = None
+
+        self.cropped_coords = dict(Car1=dict(FV=(114, 110, 1176, 610),
+                                             MVL=(343, 5, 1088, 411),
+                                             MVR=(185, 5, 915, 425),
+                                             RV=(186, 203, 1105, 630)),
+                                   Car2=dict(FV=(160, 272, 1030, 677),
+                                             MVL=(327, 7, 1096, 410),
+                                             MVR=(175, 4, 935, 404),
+                                             RV=(285, 187, 1000, 572)))
+
+        self.to_tensor = transforms.ToTensor()
+        self.resize = transforms.Resize((self.network_input_height, self.network_input_width),
+                                        interpolation=transforms.InterpolationMode.BICUBIC)
+        self.resize_label = transforms.Resize((self.network_input_height, self.network_input_width),
+                                              interpolation=transforms.InterpolationMode.NEAREST)
+
+        if "distance" in self.task:
+            with open('data/LUTs.pkl', 'rb') as f:
+                self.LUTs = pickle.load(f)
+
+    def scale_intrinsic(self, intrinsics, cropped_coords) -> tuple:
+        """Scales the intrinsics from original res to the network's initial input res"""
+        D = np.array(intrinsics[4:8], dtype=np.float32)
+        K = np.array(intrinsics[:3], dtype=np.float32)
+        K = np.insert(K, 0, 1.0)
+        K[2] += self.original_res_w / 2
+        K[3] += self.original_res_h / 2
+        if self.crop:
+            # Adjust the offset of the cropped intrinsic around the width and height.
+            K[2] -= cropped_coords[0]
+            K[3] -= cropped_coords[1]
+            # Compensate for resizing
+            K[2] *= self.network_input_width / (cropped_coords[2] - cropped_coords[0])
+            K[3] *= self.network_input_height / (cropped_coords[3] - cropped_coords[1])
+            D *= self.network_input_width / (cropped_coords[2] - cropped_coords[0])
+        else:
+            D *= self.network_input_width / self.original_res_w
+            K[2] *= self.network_input_width / self.original_res_w
+            K[3] *= self.network_input_height / self.original_res_h
+        return K, D
+
+    def get_displacements_from_speed(self, frame_index, cam_side):
+        """get displacement magnitudes using speed and time."""
+
+        previous_oxt_file = json.load(open(os.path.join(self.data_path, "vehicle_data", "previous_images",
+                                                        f'{frame_index}_{cam_side}.json')))
+
+        present_oxt_file = json.load(open(os.path.join(self.data_path, "vehicle_data", "rgb_images",
+                                                       f'{frame_index}_{cam_side}.json')))
+
+        timestamps = [float(previous_oxt_file["timestamp"]) / 1e6, float(present_oxt_file["timestamp"]) / 1e6]
+        # Convert km/hr to m/s
+        speeds_ms = [float(previous_oxt_file["ego_speed"]) / 3.6, float(present_oxt_file["ego_speed"]) / 3.6]
+
+        displacement = np.array(0.5 * (speeds_ms[1] + speeds_ms[0]) * (timestamps[1] - timestamps[0])).astype(
+            np.float32)
+
+        return displacement
+
+    def get_image(self, index, cropped_coords, frame_index, cam_side):
+        recording_folder = "rgb_images" if index == 0 else "previous_images"
+        file = f"{frame_index}_{cam_side}.png" if index == 0 else f"{frame_index}_{cam_side}_prev.png"
+        path = os.path.join(self.data_path, recording_folder, file)
+        image = Image.open(path).convert('RGB')
+        if self.crop:
+            return image.crop(cropped_coords)
+        return image
+
+    def get_label(self, gt_folder, cropped_coords, frame_index, cam_side):
+        path = os.path.join(self.data_path, gt_folder, "gtLabels", f"{frame_index}_{cam_side}.png")
+        image = Image.open(path).convert('L')
+        if self.crop:
+            return image.crop(cropped_coords)
+        return image
+
+    def get_intrinsics(self, cropped_coords, frame_index, cam_side):
+        data = json.load(open(os.path.join(self.data_path, "calibration_data", "calibration",
+                                           f"{frame_index}_{cam_side}.json")))
+        intrinsics = list(data['intrinsic'].values())
+        K, D = self.scale_intrinsic(intrinsics, cropped_coords)
+        return K, D, intrinsics
+
+
+    def to_tensor_semantic_label(self, label: np.array) -> torch.LongTensor:
+        label[label > self.semantic_classes - 1] = 0
+        return torch.LongTensor(label)
+
+    @staticmethod
+    def to_tensor_motion_label(label: np.array) -> torch.LongTensor:
+        label[label > 0] = 1  # Any class greater than 0 is set to 1
+        return torch.LongTensor(label)
+
+    def preprocess(self, inputs):
+        """Resize color images to the required scales and augment if required.
+        Create the color_aug object in advance and apply the same augmentation to all images in this item.
+        This ensures that all images input to the pose network receive the same augmentation.
+        """
+        labels_list = ["motion_labels", "semantic_labels"]
+
+        for k in list(inputs):
+            if "color" in k:
+                name, frame_id, _ = k
+                inputs[(name, frame_id, 0)] = self.resize(inputs[(name, frame_id, -1)])
+            elif any(x in k for x in labels_list):
+                name, frame_id, _ = k
+                inputs[(name, frame_id, 0)] = self.resize_label(inputs[(name, frame_id, -1)])
+            else:
+                name, frame_id = k
+                inputs[(name, frame_id)] = inputs[(name, frame_id)]
+
+        for k in list(inputs):
+            f = inputs[k]
+            if "color" in k:
+                name, frame_id, scale = k
+                inputs[(name, frame_id, scale)] = self.to_tensor(f)
+                inputs[(name + "_aug", frame_id, scale)] = self.to_tensor(self.color_aug(f))
+            elif any(x in k for x in labels_list):
+                name, frame_id, scale = k
+                if name == "semantic_labels":
+                    inputs[(name, frame_id, scale)] = self.to_tensor_semantic_label(np.array(f))
+                elif name == "motion_labels":
+                    inputs[(name, frame_id, scale)] = self.to_tensor_motion_label(np.array(f))
+            else:
+                name, frame_id = k
+                if name == "detection_labels":
+                    inputs[(name, frame_id)] = f
+                else:
+                    inputs[(name, frame_id)] = torch.from_numpy(f)
+
+    def destruct_original_image_tensors(self, inputs):
+        for i in self.frame_idxs:
+            del inputs[("color", i, -1)]
+            del inputs[("color_aug", i, -1)]
+        if "semantic" in self.task:
+            del inputs[("semantic_labels", 0, -1)]
+        if "motion" in self.task:
+            del inputs[("motion_labels", 0, -1)]
+
+    def create_and_process_training_items(self, index):
+        inputs = dict()
+        do_color_aug = self.is_train and random.random() > 0.5
+        frame_index, cam_side = self.image_paths[index].split('.')[0].split('_')
+
+        if self.crop:
+            if int(frame_index[1:]) < self.total_car1_images:
+                cropped_coords = self.cropped_coords["Car1"][cam_side]
+            else:
+                cropped_coords = self.cropped_coords["Car2"][cam_side]
+        else:
+            cropped_coords = None
+
+        for i in self.frame_idxs:
+            inputs[("color", i, -1)] = self.get_image(i, cropped_coords, frame_index, cam_side)
+
+            if "distance" in self.task:
+                if self.is_train:
+                    inputs[("K", i)], inputs[("D", i)], intrinsics = self.get_intrinsics(cropped_coords,
+                                                                                         frame_index, cam_side)
+                    k1 = intrinsics[4]
+                    inputs[("theta_lut", i)] = self.LUTs[k1]["theta"]
+                    inputs[("angle_lut", i)] = self.LUTs[k1]["angle_maps"]
+
+        if "distance" in self.task:
+            inputs[("displacement_magnitude", -1)] = self.get_displacements_from_speed(frame_index, cam_side)
+
+        if "semantic" in self.task:
+            inputs[("semantic_labels", 0, -1)] = self.get_label("semantic_annotations", cropped_coords, frame_index,
+                                                                cam_side)
+
+        if "motion" in self.task:
+            inputs[("motion_labels", 0, -1)] = self.get_label("motion_annotations", cropped_coords, frame_index,
+                                                              cam_side)
+
+        if "detection" in self.task:
+            inputs[("detection_labels", 0)] = self.get_detection_label(cropped_coords, frame_index, cam_side)
+
+        if do_color_aug:
+            self.color_aug = transforms.ColorJitter(brightness=(0.8, 1.2),
+                                                    contrast=(0.8, 1.2),
+                                                    saturation=(0.8, 1.2),
+                                                    hue=(-0.1, 0.1))
+        else:
+            self.color_aug = (lambda x: x)
+
+        self.preprocess(inputs)
+        self.destruct_original_image_tensors(inputs)
+
+        return inputs
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, index):
+        """Returns a single training item from the dataset as a dictionary.
+        Values correspond to torch tensors.
+        Keys in the dictionary are either strings or tuples:
+            ("color",          <frame_id>, <scale>)       raw color images,
+            ("K",              <frame_id>)                camera intrinsics,
+            ("D",              <frame_id>)                distortion coefficients,
+            ("angle_lut",      <frame_id>)                look up table containing coords for angle of incidence,
+            ("theta_lut",      <frame_id>)                look up table containing coords for angle in the image plane,
+            ("color_aug",      <frame_id>)                augmented color image list similar to above raw color list,
+            ("displacement_magnitude", -1)                displacement from t-1 to t (reference frame)
+            ("displacement_magnitude",  1)                displacement from t+1 to t (reference frame)
+            ("motion_labels",  <frame_id>, <scale>        motion segmentation labels of t (reference frame)
+            ("semantic_labels",<frame_id>, <scale>)       semantic segmentation labels of t (reference frame)
+            ("detection_labels", <frame_id>, <scale>)     detection labels of t (reference frame)
+
+        <frame_id> is either:
+            an integer (e.g. 0, -1, or 1) representing the temporal step relative to 'index',
+
+        <scale> is an integer representing the scale of the image relative to the full size image:
+           -1       images at native resolution as loaded from disk
+            0       images resized to (self.width,      self.height     )
+            1       images resized to (self.width // 2, self.height // 2)
+            2       images resized to (self.width // 4, self.height // 4)
+            3       images resized to (self.width // 8, self.height // 8)
+        """
+        return self.create_and_process_training_items(index)
+
+    def collate_fn(self, batch):
+        """Handling the detection_label as each image has a different number of objects so when batch_size > 1,
+        the pytorch loader couldn't handle it. So here we stack the bounding boxes to be (#of_object, 6).
+        If there is no orientation and to be (#of_object, 7) if the orientation parameters is on.
+        :param batch: output returned from __getitem__ function
+        :return: return modified version from the batch after edit "detection_label"
+        """
+        for key in list(batch[0].keys()):
+            temp = []
+            for i in range(self.batch_size):
+                if key == ("detection_labels", 0):
+                    batch[i][key][:, 0] = i
+                    temp.append(batch[i][key])
+                else:
+                    temp.append(batch[i][key].unsqueeze(0))
+            batch[0][key] = torch.cat(temp, 0)
+        return batch[0]
+
+
+
+
+
+
+
+class SemanticInit(TrainUtils):
+    def __init__(self, args):
+        super().__init__(args)
+
+        semantic_class_weights = dict(
+            woodscape_enet=([3.25, 2.33, 20.42, 30.59, 38.4, 45.73, 10.76, 34.16, 44.3, 49.19]),
+            woodscape_mfb=(0.04, 0.03, 0.43, 0.99, 2.02, 4.97, 0.17, 1.01, 3.32, 20.35),
+            lens_soiling=([3.25, 2.33, 20.42, 30.59]))
+
+        print(f"=> Setting Class weights based on: {args['semantic_class_weighting']} \n"
+              f"=> {semantic_class_weights[args['semantic_class_weighting']]}")
+
+        semantic_class_weights = torch.tensor(semantic_class_weights[args['semantic_class_weighting']]).to(args['device'])
+
+        self.metric = IoU(args['semantic_num_classes'], args['dataset'], ignore_index=None)
+
+        if args['semantic_loss'] == "cross_entropy":
+            self.semantic_criterion = CrossEntropyLoss2d(weight=semantic_class_weights)
+        elif args['semantic_loss'] == "focal_loss":
+            self.semantic_criterion = FocalLoss(weight=semantic_class_weights, gamma=2, size_average=True)
+        self.best_semantic_iou = 0.0
+        self.alpha = 0.5  # to blend semantic predictions with color image
+        self.color_encoding = semantic_color_encoding(args)
+
+
+class SemanticModel(SemanticInit):
+    def __init__(self, args):
+        super().__init__(args)
+
+        self.models["encoder"] = ResnetEncoder(num_layers=self.args['network_layers'], pretrained=True).to(self.device)
+        self.models["semantic"] = SemanticDecoder(self.models["encoder"].num_ch_enc,
+                                                  n_classes=args['semantic_num_classes']).to(self.device)
+        self.parameters_to_train += list(self.models["encoder"].parameters())
+        self.parameters_to_train += list(self.models["semantic"].parameters())
+
+        if args['use_multiple_gpu']:
+            self.models["encoder"] = torch.nn.DataParallel(self.models["encoder"])
+            self.models["semantic"] = torch.nn.DataParallel(self.models["semantic"])
+
+        print(f"=> Training on the {self.args['dataset'].upper()} dataset \n"
+              f"=> Training model named: {self.args['model_name']} \n"
+              f"=> Models and tensorboard events files are saved to: {self.args['output_directory']} \n"
+              f"=> Training is using the cuda device id: {self.args['cuda_visible_devices']} \n"
+              f"=> Loading {self.args['dataset']} training and validation dataset")
+
+        train_dataset = WoodScapeRawDataset(data_path=args['dataset_dir'],
+                                            path_file=args['train_file'],
+                                            is_train=True,
+                                            config=args)
+
+        self.train_loader = DataLoader(train_dataset,
+                                       batch_size=args['batch_size'],
+                                       shuffle=True,
+                                       num_workers=args['num_workers'],
+                                       pin_memory=True,
+                                       drop_last=False)
+
+        val_dataset = WoodScapeRawDataset(data_path=args['dataset_dir'],
+                                          path_file=args['val_file'],
+                                          is_train=False,
+                                          config=args)
+
+        self.val_loader = DataLoader(val_dataset,
+                                     batch_size=args['batch_size'],
+                                     shuffle=True,
+                                     num_workers=args['num_workers'],
+                                     pin_memory=True,
+                                     drop_last=True)
+        print(f"=> Total number of training examples: {len(train_dataset)} \n"
+              f"=> Total number of validation examples: {len(val_dataset)}")
+
+        self.num_total_steps = len(train_dataset) // args['batch_size'] * args['epochs']
+        self.configure_optimizers()
+
+        if 'cuda' in self.device:
+            torch.cuda.synchronize()
+
+    def semantic_train(self):
+        for self.epoch in range(self.args['epochs']):
+            self.set_train()
+            data_loading_time = 0
+            gpu_time = 0
+            before_op_time = time.time()
+
+            for batch_idx, inputs in enumerate(self.train_loader):
+                current_time = time.time()
+                data_loading_time += (current_time - before_op_time)
+                before_op_time = current_time
+                # -- PUSH INPUTS DICT TO DEVICE --
+                self.inputs_to_device(inputs)
+
+                features = self.models["encoder"](inputs["color_aug", 0, 0])
+                outputs = self.models["semantic"](features)
+
+                losses = dict()
+                losses["semantic_loss"] = self.semantic_criterion(outputs["semantic", 0],
+                                                                  inputs["semantic_labels", 0, 0])
+
+                # -- COMPUTE GRADIENT AND DO OPTIMIZER STEP --
+                self.optimizer.zero_grad()
+                losses["semantic_loss"].backward()
+                self.optimizer.step()
+
+                duration = time.time() - before_op_time
+                gpu_time += duration
+
+                if batch_idx % self.args['log_frequency'] == 0:
+                    self.log_time(batch_idx, duration, losses["semantic_loss"].cpu().data, data_loading_time, gpu_time)
+                    self.semantic_statistics("train", inputs, outputs, losses)
+                    data_loading_time = 0
+                    gpu_time = 0
+
+                self.step += 1
+                before_op_time = time.time()
+
+            # Validate on each step, save model on improvements
+            val_metrics = self.semantic_val()
+            print(self.epoch, "IoU:", val_metrics["mean_iou"])
+            if val_metrics["mean_iou"] >= self.best_semantic_iou:
+                print(f"=> Saving model weights with mean_iou of {val_metrics['mean_iou']:.3f} "
+                      f"at step {self.step} on {self.epoch} epoch.")
+                self.best_semantic_iou = val_metrics["mean_iou"]
+                self.save_model()
+
+            self.lr_scheduler.step(val_metrics["mean_iou"])
+
+        print("Training complete!")
+
+    @torch.no_grad()
+    def semantic_val(self):
+        """Validate the semantic model"""
+        self.set_eval()
+        losses = dict()
+        for inputs in self.val_loader:
+            self.inputs_to_device(inputs)
+            features = self.models["encoder"](inputs["color", 0, 0])
+            outputs = self.models["semantic"](features)
+            losses["semantic_loss"] = self.semantic_criterion(outputs["semantic", 0], inputs["semantic_labels", 0, 0])
+            _, predictions = torch.max(outputs["semantic", 0].data, 1)
+            self.metric.add(predictions, inputs["semantic_labels", 0, 0])
+        outputs["class_iou"], outputs["mean_iou"] = self.metric.value()
+
+        # Compute stats for the tensorboard
+        self.semantic_statistics("val", inputs, outputs, losses)
+        self.metric.reset()
+        del inputs, losses
+        self.set_train()
+
+        return outputs
+
+    def semantic_statistics(self, mode, inputs, outputs, losses) -> None:
+        writer = self.writers[mode]
+        for loss, value in losses.items():
+            writer.add_scalar(f"{loss}", value.mean(), self.step)
+
+        if mode == "val":
+            writer.add_scalar(f"mean_iou", outputs["mean_iou"], self.step)
+            for k, v in outputs["class_iou"].items():
+                writer.add_scalar(f"class_iou/{k}", v, self.step)
+
+        writer.add_scalar("learning_rate", self.optimizer.param_groups[0]['lr'], self.step)
+
+        for j in range(min(4, self.args['batch_size'])):  # write maximum of four images
+            if self.args['train'] == "semantic":
+                writer.add_image(f"color/{j}", inputs[("color", 0, 0)][j], self.step)
+
+            # Predictions is one-hot encoded with "num_classes" channels.
+            # Convert it to a single int using the indices where the maximum (1) occurs
+            _, predictions = torch.max(outputs["semantic", 0][j].data, 0)
+            predictions_gray = predictions.byte().squeeze().cpu().detach().numpy()
+            color_semantic = np.array(self.trans_pil(inputs[("color", 0, 0)].cpu()[j].data))
+            not_background = predictions_gray != 0
+            color_semantic[not_background, ...] = (color_semantic[not_background, ...] * (1 - self.alpha) +
+                                                   self.color_encoding[predictions_gray[not_background]] * self.alpha)
+            writer.add_image(f"semantic_pred_0/{j}", color_semantic.transpose(2, 0, 1), self.step)
+
+            labels = inputs["semantic_labels", 0, 0][j].data
+            labels_gray = labels.byte().squeeze().cpu().detach().numpy()
+            labels_rgb = np.array(self.trans_pil(inputs[("color", 0, 0)].cpu()[j].data))
+            not_background = labels_gray != 0
+            labels_rgb[not_background, ...] = (labels_rgb[not_background, ...] * (1 - self.alpha) +
+                                               self.color_encoding[labels_gray[not_background]] * self.alpha)
+            writer.add_image(f"semantic_labels_0/{j}", labels_rgb.transpose(2, 0, 1), self.step)
+
+
+
+#util
+
+class TrainUtils:
+    def __init__(self, args):
+        """Train Utils class providing training utilities for distance, semantic and motion estimation
+        :param args: input params from config file
+        """
+        self.args = args
+        self.device = args["device"]
+        self.log_path = os.path.join(args["output_directory"], args["model_name"])
+        self.models = dict()
+        self.parameters_to_train = []
+        self.epoch = 0
+        self.step = 0
+        self.start_time = time.time()
+        self.trans_pil = transforms.ToPILImage()
+        self.optimizer = None
+        self.lr_scheduler = None
+
+        self.writers = dict()
+        for mode in ["train", "val"]:
+            self.writers[mode] = SummaryWriter(os.path.join(self.log_path, mode))
+
+    def inputs_to_device(self, inputs):
+        for key, ipt in inputs.items():
+            inputs[key] = ipt.to(self.device)
+
+    def set_train(self):
+        """Convert all models to training mode"""
+        for m in self.models.values():
+            m.train()
+
+    def set_eval(self):
+        """Convert all models to testing/evaluation mode"""
+        for m in self.models.values():
+            m.eval()
+
+    def log_time(self, batch_idx, duration, loss, data_time, gpu_time):
+        """Print a logging statement to the terminal"""
+        samples_per_sec = self.args['batch_size'] / duration
+        time_sofar = time.time() - self.start_time
+        training_time_left = (self.num_total_steps / self.step - 1.0) * time_sofar if self.step > 0 else 0
+        print(f"{Fore.GREEN}epoch {self.epoch:>3}{Style.RESET_ALL} "
+              f"| batch {batch_idx:>6} "
+              f"| current lr {self.optimizer.param_groups[0]['lr']:.4f} "
+              f"| examples/s: {samples_per_sec:5.1f} "
+              f"| {Fore.RED}loss: {loss:.5f}{Style.RESET_ALL} "
+              f"| {Fore.BLUE}time elapsed: {self.sec_to_hm_str(time_sofar)}{Style.RESET_ALL} "
+              f"| {Fore.CYAN}time left: {self.sec_to_hm_str(training_time_left)}{Style.RESET_ALL} "
+              f"| CPU/GPU time: {data_time:0.1f}s/{gpu_time:0.1f}s")
+
+    def configure_optimizers(self):
+        self.optimizer = torch.optim.Adam(self.parameters_to_train, self.args['learning_rate'])
+        self.lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(self.optimizer, self.args['scheduler_step_size'])
+
+    def save_model(self):
+        """Save model weights to disk"""
+        save_folder = os.path.join(self.log_path, "models", f"weights_{self.epoch}", str(self.step))
+        if not os.path.exists(save_folder):
+            os.makedirs(save_folder)
+
+        for model_name, model in self.models.items():
+            save_path = os.path.join(save_folder, f"{model_name}.pth")
+            to_save = model.state_dict()
+            if model_name == 'encoder':
+                to_save['height'] = self.args['input_height']
+                to_save['width'] = self.args['input_width']
+            torch.save(to_save, save_path)
+
+        save_path = os.path.join(save_folder, "adam.pth")
+        if self.epoch > 50:  # Optimizer file is quite large! Sometimes, life is a compromise.
+            torch.save(self.optimizer.state_dict(), save_path)
+
+    def load_model(self):
+        """Load model(s) from disk"""
+        self.args['pretrained_weights'] = os.path.expanduser(self.args['pretrained_weights'])
+
+        assert os.path.isdir(self.args['pretrained_weights']), f"Cannot find folder {self.args['pretrained_weights']}"
+        print(f"=> Loading model from folder {self.args['pretrained_weights']}")
+
+        for n in self.args['models_to_load']:
+            print(f"Loading {n} weights...")
+            path = os.path.join(self.args['pretrained_weights'], f"{n}.pth")
+            model_dict = self.models[n].state_dict()
+            pretrained_dict = torch.load(path, map_location=self.args['device'])
+            pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
+            model_dict.update(pretrained_dict)
+            self.models[n].load_state_dict(model_dict)
+
+    def save_args(self):
+        """Save arguments to disk so we know what we ran this experiment with"""
+
+        models_dir = os.path.join(self.log_path, "models")
+        if not os.path.exists(models_dir):
+            os.makedirs(models_dir)
+
+    def sec_to_hm(self, t):
+        """Convert time in seconds to time in hours, minutes and seconds
+        e.g. 10239 -> (2, 50, 39)
+        """
+        t = int(t)
+        s = t % 60
+        t //= 60
+        m = t % 60
+        t //= 60
+        return t, m, s
+
+    def sec_to_hm_str(self, t):
+        """Convert time in seconds to a nice string
+        e.g. 10239 -> '02h50m39s'
+        """
+        h, m, s = self.sec_to_hm(t)
+        return f"{h:02d}h{m:02d}m{s:02d}s"
+
+
+class AverageMeter:
+    """Computes and stores the average and current value"""
+
+    def __init__(self):
+        self.initialized = False
+        self.val = None
+        self.avg = None
+        self.sum = None
+        self.count = None
+
+    def initialize(self, val, weight):
+        self.val = val
+        self.avg = val
+        self.sum = val * weight
+        self.count = weight
+        self.initialized = True
+
+    def update(self, val, weight=1):
+        if not self.initialized:
+            self.initialize(val, weight)
+        else:
+            self.add(val, weight)
+
+    def add(self, val, weight):
+        self.val = val
+        self.sum += val * weight
+        self.count += weight
+        self.avg = self.sum / self.count
+
+    def value(self):
+        return self.val
+
+    def average(self):
+        return self.avg
+
+    @staticmethod
+    def accuracy(preds, label):
+        valid = (label >= 0)
+        acc_sum = (valid * (preds == label)).sum()
+        valid_sum = valid.sum()
+        acc = float(acc_sum) / (valid_sum + 1e-10)
+        return acc, valid_sum
+
+
+
+class IoU:
+    """Computes the intersection over union (IoU) per class and corresponding mean (mIoU).
+    The predictions are first accumulated in a confusion matrix and the IoU is computed from it as follows:
+        IoU = true_positive / (true_positive + false_positive + false_negative).
+    :param num_classes (int): number of classes in the classification problem
+    :param dataset (string): woodscape_raw
+    :param ignore_index (int or iterable, optional): Index of the classes to ignore when computing the IoU.
+    """
+
+    def __init__(self, num_classes, dataset, ignore_index=None):
+        super().__init__()
+
+        self.conf_metric = np.ndarray((num_classes, num_classes), dtype=np.int32)
+        self.num_classes = num_classes
+        self.dataset = dataset
+
+        self.classes = dict(woodscape_raw=["void", "road", "lanemarks", "curb", "person",
+                                           "rider", "vehicles", "bicycle", "motorcycle""traffic_sign"],
+                            motion=['static', 'motion'], )
+
+        self.reset()
+
+        if ignore_index is None:
+            self.ignore_index = None
+        elif isinstance(ignore_index, int):
+            self.ignore_index = (ignore_index,)
+        else:
+            try:
+                self.ignore_index = tuple(ignore_index)
+            except TypeError:
+                raise ValueError("'ignore_index' must be an int or iterable")
+
+    def reset(self):
+        self.conf_metric.fill(0)
+
+    def add(self, predicted, target):
+        """Adds the predicted and target pair to the IoU metric."""
+
+        predicted = predicted.view(-1).cpu().numpy()
+        target = target.view(-1).cpu().numpy()
+        # hack for bin counting 2 arrays together
+        x = predicted + self.num_classes * target
+        bincount_2d = np.bincount(x.astype(np.int32), minlength=self.num_classes ** 2)
+        assert bincount_2d.size == self.num_classes ** 2
+        conf = bincount_2d.reshape((self.num_classes, self.num_classes))
+        self.conf_metric += conf
+
+    def value(self):
+        """Computes the IoU and mean IoU.
+        The mean computation ignores NaN elements of the IoU array.
+        Returns: Tuple: (class_iou, mIoU). The first output is the per class IoU, for K classes it's numpy.ndarray with
+        K elements. The second output, is the mean IoU.
+        """
+        if self.ignore_index is not None:
+            for index in self.ignore_index:
+                self.conf_metric[:, self.ignore_index] = 0
+                self.conf_metric[self.ignore_index, :] = 0
+        true_positive = np.diag(self.conf_metric)
+        false_positive = np.sum(self.conf_metric, 0) - true_positive
+        false_negative = np.sum(self.conf_metric, 1) - true_positive
+
+        # Just in case we get a division by 0, ignore/hide the error
+        with np.errstate(divide='ignore', invalid='ignore'):
+            iou = true_positive / (true_positive + false_positive + false_negative)
+
+        class_dict = self.classes[self.dataset]
+        class_iou = dict(zip(class_dict, iou))
+
+        return class_iou, np.nanmean(iou)
+
+
+def semantic_color_encoding(args):
+    semantic_classes = dict(clean=(0, 0, 0),
+                            transparent=(149, 213, 0),
+                            semi_transparent=(216, 45, 128),
+                            Opaque=(0, 140, 88))
+    color_encoding = np.zeros((args['semantic_num_classes'], 3), dtype=np.uint8)
+    for i, (k, v) in enumerate(semantic_classes.items()):
+        color_encoding[i] = v
+    return color_encoding
+
+
+
+
+# main
+
+
+def main():
+    args = collect_tupperware()
+    log_path = os.path.join(args["output_directory"], args["model_name"]) # 출력 파일 저장할 디렉토리 설정
+
+    if os.path.isdir(log_path):
+        if strtobool(input("=> Clean up the log directory?")):
+            shutil.rmtree(log_path, ignore_errors=False, onerror=None)
+            os.mkdir(log_path)
+            print("=> Cleaned up the logs!")
+        else:
+            print("=> No clean up performed!")
+    else:
+        print(f"=> No pre-existing directories found for this experiment. \n"
+              f"=> Creating a new one!")
+        os.mkdir(log_path)
+
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ["CUDA_VISIBLE_DEVICES"] = args["cuda_visible_devices"] or "-1"
+
+    if args["train"] == "semantic":
+        model = SemanticModel(args)
+        model.semantic_train()
+
+if __name__ == "__main__":
+
+    main()
